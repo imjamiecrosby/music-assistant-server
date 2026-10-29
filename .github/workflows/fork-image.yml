@@ -1,0 +1,95 @@
+# Fork-only: build a test image of the hue-dance-party branch for a self-hosted server.
+# Mirrors the wheel + image steps of release.yml without the bundled app secrets, which only
+# the official builds may carry. Drop this file before opening a PR upstream.
+name: Fork test image
+
+on:
+  push:
+    branches:
+      - hue-dance-party
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same base image as the upstream nightly channel, which tracks dev.
+  BASE_IMAGE_VERSION: "1.7.0"
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    if: github.repository != 'music-assistant/server'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: ".python-version"
+          check-latest: true
+
+      - name: Install build dependencies
+        run: python3 -m pip install build tomli tomli-w
+
+      - name: Set package version
+        id: version
+        run: |
+          version="2.12.0.dev${GITHUB_RUN_NUMBER}"
+          python3 - "$version" <<'EOF'
+          import sys
+          import tomli
+          import tomli_w
+
+          with open("pyproject.toml", "rb") as file_handle:
+              pyproject = tomli.load(file_handle)
+          pyproject["project"]["version"] = sys.argv[1]
+          with open("pyproject.toml", "wb") as file_handle:
+              tomli_w.dump(pyproject, file_handle)
+          EOF
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        id: wheel
+        run: |
+          python3 -m build --wheel
+          echo "sha256=$(sha256sum dist/*.whl | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+          build-args: |
+            MASS_VERSION=${{ steps.version.outputs.version }}
+            MASS_REVISION=${{ github.sha }}
+            MASS_WHEEL_SHA256=${{ steps.wheel.outputs.sha256 }}
+            BASE_IMAGE_VERSION=${{ env.BASE_IMAGE_VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
