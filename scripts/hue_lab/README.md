@@ -39,6 +39,17 @@ same interface as `HueAudioAnalyzer` works (see `Engine` in `replay.py`), which 
 how the new effects engine gets compared against the current one on identical input.
 The lab only needs `pip install hue-entertainment`, not the whole server.
 
+The section-aware party engine is the first such alternative:
+
+```sh
+python -m scripts.hue_lab render synth.jsonl \
+  --engine music_assistant/providers/hue_entertainment/party_engine.py:PartyEngine
+```
+
+Engines that implement `debug_state()` have it captured per frame in the output's
+`debug` list. The party engine reports its scene there, and the command prints a scene
+timeline, so detection can be checked against a synthetic track's known sections.
+
 ## 3. Preview
 
 ```sh

@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
 
 from hue_entertainment import LightChannel
@@ -63,13 +63,21 @@ def load_engine_class(spec: str) -> type[Any]:
     Load an engine class from ``path/to/file.py:ClassName``.
 
     Loading by file path keeps the lab independent of the Music Assistant package
-    import chain, so it runs with only ``hue-entertainment`` installed.
+    import chain, so it runs with only ``hue-entertainment`` installed. The file is
+    loaded into a stand-in package for its directory, so relative imports of sibling
+    modules (``from .analyzer import ...``) work without running the provider's
+    ``__init__``.
 
     :param spec: File path and class name separated by a colon.
     """
     file_part, _, class_name = spec.rpartition(":")
     path = Path(file_part).resolve()
-    module_name = f"hue_lab_engine_{path.stem}_{abs(hash(path)) % 10_000}"
+    package_name = f"hue_lab_engines_{abs(hash(path.parent)) % 10_000}"
+    if package_name not in sys.modules:
+        package = ModuleType(package_name)
+        package.__path__ = [str(path.parent)]
+        sys.modules[package_name] = package
+    module_name = f"{package_name}.{path.stem}"
     module_spec = importlib.util.spec_from_file_location(module_name, path)
     if module_spec is None or module_spec.loader is None:
         msg = f"Cannot load engine module from {path}"
@@ -125,6 +133,10 @@ def replay(rec: Recording, opts: ReplayOptions) -> dict[str, Any]:
     beats: list[list[float]] = []
     peaks: list[list[float]] = []
     energy: list[float] = []
+    # Engines may expose debug_state() (e.g. the party engine's scene); it is
+    # captured per frame so scene changes can be checked against the song.
+    debug_state = getattr(engine, "debug_state", None)
+    debug: list[dict[str, Any]] = []
     idx = 0
 
     while clock + latency_us <= end_ts:
@@ -134,9 +146,11 @@ def replay(rec: Recording, opts: ReplayOptions) -> dict[str, Any]:
         commands = engine.render(clock + latency_us)
         by_id = {c.channel_id: c for c in commands}
         frames.append([_to_rgb8(by_id.get(cid)) for cid in order])
+        if debug_state is not None:
+            debug.append(debug_state())
         clock += period_us
 
-    return {
+    result: dict[str, Any] = {
         "version": 1,
         "source": str(rec.path) if rec.path else rec.header["area"]["name"],
         "engine": opts.engine.rsplit("/", 1)[-1],
@@ -149,6 +163,9 @@ def replay(rec: Recording, opts: ReplayOptions) -> dict[str, Any]:
         "peaks": sorted(peaks),
         "energy": energy,
     }
+    if debug:
+        result["debug"] = debug
+    return result
 
 
 def _deliver(

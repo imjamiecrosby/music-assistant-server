@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from .recording import load_recording, synthesize, write_recording
 from .replay import DEFAULT_ENGINE, ReplayOptions, replay
@@ -59,6 +60,18 @@ def main() -> None:
         f"Rendered {len(result['frames'])} frames ({result['duration_s']:.1f}s, "
         f"{len(result['channels'])} lights) to {out}"
     )
+    _print_scenes(result)
+
+
+def _print_scenes(result: dict[str, Any]) -> None:
+    """Print where the engine changed scene, when it reports one through debug_state()."""
+    debug = result.get("debug") or []
+    previous = None
+    for frame, state in enumerate(debug):
+        scene = state.get("scene")
+        if scene != previous:
+            print(f"  {frame / result['fps']:7.2f}s  {scene}")
+            previous = scene
 
 
 if __name__ == "__main__":

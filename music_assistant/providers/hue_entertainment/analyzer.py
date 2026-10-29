@@ -776,54 +776,12 @@ class HueAudioAnalyzer:
         + neighbour-contrast passes: their variation is deliberately subtle and
         those passes would flatten it back into a single color.
         """
-        raw, synthesized = self._gather_raw_palette()
-        ordered = _order_palette(raw)
         max_pulse = max(self._mode.pulse_peak, self._mode.downbeat_pulse_peak)
-        equalized = _equalize_palette(ordered, max_pulse)
-        if synthesized:
-            return equalized
-        deduped = _drop_close_neighbours(equalized, _PALETTE_DEDUP_DISTANCE)
-        return _enforce_neighbour_contrast(deduped, deduped)
+        return build_palette(self._server_palette, max_pulse)
 
     def _gather_raw_palette(self) -> tuple[list[tuple[float, float, float]], bool]:
-        """
-        Collect server colors and synthesise a gradient where needed.
-
-        Returns ``(colors, synthesized)``. The server derives most color@v1
-        fields from a single primary, so a colored cover usually yields one hue
-        plus several near-whites. We therefore key off how many distinct hue
-        families the chromatic colors span:
-
-        - Two or more distinct hues: cycle the album's real colors.
-        - A single hue (any number of shades of it): expand the most saturated
-          one into a same-family gradient, dropping the washed near-whites.
-        - No chromatic color at all: a subtle neutral tint sweep.
-
-        Only when the color role has produced nothing at all do we fall back
-        to the neutral gradient (same one used for monochrome covers). The
-        boolean flags the synthesized cases so the caller can skip passes
-        that would flatten their subtle variation.
-        """
-        bases: list[tuple[float, float, float]] = []
-        seen: set[tuple[int, int, int]] = set()
-        for name in _PALETTE_SOURCE_FIELDS:
-            value = self._server_palette.get(name)
-            if value is None or value in seen:
-                continue
-            seen.add(value)
-            base = (value[0] / 255.0, value[1] / 255.0, value[2] / 255.0)
-            if max(base) < _BLACK_DROP_THRESHOLD:
-                continue
-            bases.append(_boost_saturation(base, _PALETTE_SATURATION_BOOST))
-        if not bases:
-            return list(_NEUTRAL_GRADIENT), True
-        chromatic = [c for c in bases if colorsys.rgb_to_hsv(*c)[1] >= _PALETTE_MIN_SAT]
-        if _distinct_hue_count(chromatic) >= 2:
-            return chromatic, False
-        if chromatic:
-            seed = max(chromatic, key=lambda c: colorsys.rgb_to_hsv(*c)[1])
-            return _build_shade_palette(seed), True
-        return list(_NEUTRAL_GRADIENT), True
+        """Collect server colors and synthesise a gradient where needed."""
+        return _gather_raw_palette(self._server_palette)
 
     @staticmethod
     def _to_command(channel_id: int, r: float, g: float, b: float) -> LightColorCommand:
@@ -834,6 +792,68 @@ class HueAudioAnalyzer:
             green=int(max(0.0, min(1.0, g)) * 65535),
             blue=int(max(0.0, min(1.0, b)) * 65535),
         )
+
+
+def build_palette(
+    server_palette: dict[str, tuple[int, int, int] | None], pulse_peak: float = 1.0
+) -> list[tuple[float, float, float]]:
+    """
+    Turn a color@v1 palette into an ordered, evenly bright cycling palette.
+
+    :param server_palette: Merged color@v1 fields as 0-255 RGB triples.
+    :param pulse_peak: Largest brightness multiplier the caller applies on top;
+        values above 1.0 leave matching headroom below the LED cap.
+    """
+    raw, synthesized = _gather_raw_palette(server_palette)
+    ordered = _order_palette(raw)
+    equalized = _equalize_palette(ordered, pulse_peak)
+    if synthesized:
+        return equalized
+    deduped = _drop_close_neighbours(equalized, _PALETTE_DEDUP_DISTANCE)
+    return _enforce_neighbour_contrast(deduped, deduped)
+
+
+def _gather_raw_palette(
+    server_palette: dict[str, tuple[int, int, int] | None],
+) -> tuple[list[tuple[float, float, float]], bool]:
+    """
+    Collect server colors and synthesise a gradient where needed.
+
+    Returns ``(colors, synthesized)``. The server derives most color@v1
+    fields from a single primary, so a colored cover usually yields one hue
+    plus several near-whites. We therefore key off how many distinct hue
+    families the chromatic colors span:
+
+    - Two or more distinct hues: cycle the album's real colors.
+    - A single hue (any number of shades of it): expand the most saturated
+      one into a same-family gradient, dropping the washed near-whites.
+    - No chromatic color at all: a subtle neutral tint sweep.
+
+    Only when the color role has produced nothing at all do we fall back
+    to the neutral gradient (same one used for monochrome covers). The
+    boolean flags the synthesized cases so the caller can skip passes
+    that would flatten their subtle variation.
+    """
+    bases: list[tuple[float, float, float]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for name in _PALETTE_SOURCE_FIELDS:
+        value = server_palette.get(name)
+        if value is None or value in seen:
+            continue
+        seen.add(value)
+        base = (value[0] / 255.0, value[1] / 255.0, value[2] / 255.0)
+        if max(base) < _BLACK_DROP_THRESHOLD:
+            continue
+        bases.append(_boost_saturation(base, _PALETTE_SATURATION_BOOST))
+    if not bases:
+        return list(_NEUTRAL_GRADIENT), True
+    chromatic = [c for c in bases if colorsys.rgb_to_hsv(*c)[1] >= _PALETTE_MIN_SAT]
+    if _distinct_hue_count(chromatic) >= 2:
+        return chromatic, False
+    if chromatic:
+        seed = max(chromatic, key=lambda c: colorsys.rgb_to_hsv(*c)[1])
+        return _build_shade_palette(seed), True
+    return list(_NEUTRAL_GRADIENT), True
 
 
 def _lerp(

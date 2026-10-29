@@ -54,6 +54,7 @@ hue_entertainment/
 ├── provider.py                mDNS discovery, lifecycle management
 ├── bridge.py                  Sendspin visualizer client → analyzer → EntertainmentSession
 ├── analyzer.py                Bass beat detection, color cycling, effect modes
+├── party_engine.py            Section-aware party engine (chill/groove/build/peak + drops), lab-only for now
 ├── constants.py               MA config keys + Sendspin spectrum request config
 └── manifest.json              Experimental plugin manifest (requires hue-entertainment)
 ```
