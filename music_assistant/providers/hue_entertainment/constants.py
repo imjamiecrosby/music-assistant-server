@@ -15,8 +15,10 @@ CONF_HUE_LATENCY_MS: Final[str] = "hue_latency_ms"
 
 # Visualization modes; first entry is the default. Used to build the config
 # options and to migrate away orphaned stored values from older versions.
-COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energetic")
+COLOR_MODES: Final[tuple[str, ...]] = ("smooth", "ambient", "flashing", "energetic", "party")
 DEFAULT_COLOR_MODE: Final[str] = COLOR_MODES[0]
+# Rendered by the section-aware PartyEngine; every other mode is a HueAudioAnalyzer preset.
+PARTY_MODE: Final[str] = "party"
 
 DEFAULT_BRIGHTNESS: Final[int] = 100
 

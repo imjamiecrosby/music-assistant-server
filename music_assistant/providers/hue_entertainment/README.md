@@ -32,6 +32,7 @@ Entertainment areas are discovered at plugin (re)load from the Hue bridge REST A
 | **Ambient** | Colour cycling only, no brightness modulation — relaxing, smooth transitions. |
 | **Flashing** | Brightness pulse on every beat, stronger on downbeats. |
 | **Energetic** | Large brightness swings on hits plus fast palette rotation. |
+| **Party** | Section-aware show from `party_engine.py`: calm waves in quiet parts, a beat chase in the groove, lights filling upward through build-ups, and a full-room white hit on the drop. Each light flashes at most three times per second. |
 
 ## Hue streaming layer
 
@@ -54,7 +55,7 @@ hue_entertainment/
 ├── provider.py                mDNS discovery, lifecycle management
 ├── bridge.py                  Sendspin visualizer client → analyzer → EntertainmentSession
 ├── analyzer.py                Bass beat detection, color cycling, effect modes
-├── party_engine.py            Section-aware party engine (chill/groove/build/peak + drops), lab-only for now
+├── party_engine.py            Section-aware party engine behind the Party mode (chill/groove/build/peak + drops)
 ├── constants.py               MA config keys + Sendspin spectrum request config
 └── manifest.json              Experimental plugin manifest (requires hue-entertainment)
 ```
@@ -69,7 +70,7 @@ The Hue REST API, DTLS streamer, `EntertainmentSession` and data models
 |-----|------|---------|-------------|
 | `bridge_host` | String | — | Bridge IP (auto-discovered via mDNS) |
 | `brightness` | Integer | 100 | Overall light brightness (0-100) |
-| `color_mode` | String | smooth | Visualization mode (smooth / ambient / flashing / energetic) |
+| `color_mode` | String | smooth | Visualization mode (smooth / ambient / flashing / energetic / party) |
 | `hue_latency_ms` | Integer | 20 | Lead time lights render ahead of the playhead (0-3000) |
 
 ## Quick Setup

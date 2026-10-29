@@ -13,7 +13,7 @@
     },
     "color_mode": {
       "label": "Mode",
-      "description": "Visualization style. Smooth (default): spectrum-driven brightness with a slowly drifting palette. Ambient: colour cycling only, no brightness modulation. Flashing: brightness pulse on every beat, stronger on downbeats. Energetic: large brightness swings on hits plus fast palette rotation."
+      "description": "Visualization style. Smooth (default): spectrum-driven brightness with a slowly drifting palette. Ambient: colour cycling only, no brightness modulation. Flashing: brightness pulse on every beat, stronger on downbeats. Energetic: large brightness swings on hits plus fast palette rotation. Party: follows the song's structure, from calm waves in quiet parts to rising build-ups and full-room hits on the drop."
     },
     "hue_latency_ms": {
       "label": "Light latency (ms)",

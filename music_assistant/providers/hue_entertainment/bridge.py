@@ -37,11 +37,13 @@ from .analyzer import HueAudioAnalyzer
 from .constants import (
     CONF_CLIENTKEY,
     CONF_USERNAME,
+    PARTY_MODE,
     SPECTRUM_BINS,
     SPECTRUM_F_MAX,
     SPECTRUM_F_MIN,
     SPECTRUM_SCALE,
 )
+from .party_engine import PartyEngine
 from .recorder import FeatureRecorder
 from .settings import get_brightness, get_color_mode, get_hue_latency_ms
 
@@ -101,7 +103,11 @@ class HueEntertainmentBridge:
         self.logger = LOGGER.getChild(f"bridge.{area.name}")
 
         self._session: EntertainmentSession | None = None
-        self._analyzer: HueAudioAnalyzer | None = None
+        self._analyzer: HueAudioAnalyzer | PartyEngine | None = None
+        # Merged color@v1 palette and the current track's beat schedule, kept so a
+        # mode switch that swaps engines starts the new one with both.
+        self._palette: dict[str, tuple[int, int, int] | None] = {}
+        self._beat_schedule: list[BeatTiming] = []
         self._sendspin_client: SendspinClient | None = None
         self._is_streaming = False
         self._stop_debounce_task: asyncio.Task[None] | None = None
@@ -122,10 +128,10 @@ class HueEntertainmentBridge:
 
     async def start(self) -> None:
         """Start the bridge — register as an in-process Sendspin visualizer client."""
-        self._analyzer = HueAudioAnalyzer(
-            channels=self.area.channels,
-            color_mode=get_color_mode(self.provider.config),
-            brightness=get_brightness(self.provider.config),
+        self._analyzer = _create_engine(
+            self.area,
+            get_color_mode(self.provider.config),
+            get_brightness(self.provider.config),
         )
 
         client_id = f"hue-{self.area.id.replace('-', '')[:16]}"
@@ -228,7 +234,24 @@ class HueEntertainmentBridge:
         hue_latency_ms: int | None = None,
     ) -> None:
         """Update analyzer/bridge settings without restarting the bridge."""
-        if self._analyzer:
+        if (
+            self._analyzer is not None
+            and color_mode is not None
+            and (color_mode == PARTY_MODE) != isinstance(self._analyzer, PartyEngine)
+        ):
+            # Switching between the classic analyzer and the party engine swaps the
+            # engine. Queued spectrum and peaks are dropped and refill within a frame;
+            # the palette and beat schedule carry over.
+            self._analyzer = _create_engine(
+                self.area,
+                color_mode,
+                brightness if brightness is not None else get_brightness(self.provider.config),
+            )
+            if self._palette:
+                self._analyzer.apply_color_palette(self._palette)
+            if self._beat_schedule:
+                self._analyzer.push_beats(self._beat_schedule)
+        elif self._analyzer:
             self._analyzer.update_settings(
                 color_mode=color_mode,
                 brightness=brightness,
@@ -295,6 +318,7 @@ class HueEntertainmentBridge:
         self._cancel_render_loop()
         if self._analyzer is not None:
             self._analyzer.clear_beats()
+        self._beat_schedule.clear()
         if self._recorder is not None:
             self._recorder.end_session()
         if self._session is not None:
@@ -343,6 +367,7 @@ class HueEntertainmentBridge:
             self._recorder.event("stream_clear")
         if self._analyzer is not None:
             self._analyzer.clear_beats()
+        self._beat_schedule.clear()
 
     async def _debounced_stop(self) -> None:
         """Wait briefly before stopping — a new stream may start (track change)."""
@@ -381,6 +406,9 @@ class HueEntertainmentBridge:
         # replace the schedule.
         if self._recorder is not None:
             self._recorder.beats(beats)
+        now_us = self.sendspin_server.clock.now_us()
+        self._beat_schedule = [b for b in self._beat_schedule if b.timestamp_us >= now_us]
+        self._beat_schedule.extend(beats)
         if self._analyzer is not None:
             self._analyzer.push_beats(beats)
 
@@ -388,6 +416,7 @@ class HueEntertainmentBridge:
         """Drop the beat schedule (a track change re-pushes a fresh one)."""
         if self._recorder is not None:
             self._recorder.event("beats_clear")
+        self._beat_schedule.clear()
         if self._analyzer is not None:
             self._analyzer.clear_beat_schedule()
 
@@ -411,6 +440,7 @@ class HueEntertainmentBridge:
         if update:
             if self._recorder is not None:
                 self._recorder.color(update)
+            self._palette.update(update)
             self._analyzer.apply_color_palette(update)
 
     # -- Render loop --
@@ -543,3 +573,18 @@ class HueEntertainmentBridgeManager:
             with suppress(Exception):
                 await bridge.stop()
         self._bridges.clear()
+
+
+def _create_engine(
+    area: EntertainmentArea, color_mode: str, brightness: int
+) -> HueAudioAnalyzer | PartyEngine:
+    """
+    Create the effects engine for a color mode.
+
+    :param area: Entertainment area whose channels the engine renders.
+    :param color_mode: Configured mode; ``party`` selects the party engine.
+    :param brightness: Overall brightness, 0-100.
+    """
+    if color_mode == PARTY_MODE:
+        return PartyEngine(channels=area.channels, color_mode=color_mode, brightness=brightness)
+    return HueAudioAnalyzer(channels=area.channels, color_mode=color_mode, brightness=brightness)
