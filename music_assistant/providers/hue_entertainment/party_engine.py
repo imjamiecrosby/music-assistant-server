@@ -1,14 +1,15 @@
 """
 Section-aware "dance party" effects engine for Hue Entertainment.
 
-Where the classic analyzer reacts to each moment on its own, this engine follows the
-song's shape. It tracks how intense the music is relative to the track itself and
-picks a scene to match:
+Every light reacts continuously to its own spectrum band, like the classic analyzer's
+energetic mode, so each kick and snare shows. On top of that the engine follows the
+song's shape: it tracks how intense the music is relative to the track itself and picks
+a scene that sets how wide that reaction is and what happens on the beat:
 
-- chill: a slow colour wave rolling around the room (intros, breakdowns)
-- groove: a beat chase that walks a highlight from light to light
+- chill: a narrower range and a slow colour wave rolling around the room
+- groove: the full range plus a beat chase that walks a highlight from light to light
 - build: lights fill from the floor up while beat flashes grow and whiten
-- peak: high-contrast blasts on every beat, alternating sides of the room
+- peak: the widest range with hits on every beat, alternating sides of the room
 
 Jumping into the peak scene from a quiet or rising passage fires a drop: a full-room
 white hit and an immediate palette jump. Each light is limited to three flash
@@ -81,6 +82,30 @@ _DROP_HISTORY_MAX = 0.55
 _DROP_JUMP = 0.08
 _DROP_MIN_PUNCH = 0.15
 
+# Continuous per-light reactivity. Each light follows a band of the spectrum (the lowest
+# light gets the bass) and its brightness tracks how far the band's fast level sits above
+# a slow baseline, so sustained sound settles while every new hit lifts the light.
+_BAND_BINS = 11
+_BAND_RISE_TAU = 0.02
+_BAND_DECAY_TAU = 0.3
+_BAND_BASELINE_TAU = 2.5
+_BAND_TRANSIENT_SCALE = 8.0
+# Each scene's (floor, ceiling) for that reactive brightness.
+_SCENE_RANGE: dict[str, tuple[float, float]] = {
+    SCENE_CHILL: (0.28, 0.60),
+    SCENE_GROOVE: (0.30, 0.95),
+    SCENE_BUILD: (0.25, 1.0),
+    SCENE_PEAK: (0.20, 1.0),
+}
+# Onset hits lift every light by up to this much (times onset strength) per scene.
+_SCENE_HIT: dict[str, float] = {
+    SCENE_CHILL: 0.0,
+    SCENE_GROOVE: 0.2,
+    SCENE_BUILD: 0.25,
+    SCENE_PEAK: 0.3,
+}
+_HIT_DECAY_US = 250_000
+
 # Flash limiter: at most this many flash onsets per light in any rolling window.
 _FLASH_LIMIT = 3
 _FLASH_WINDOW_US = 1_000_000
@@ -135,6 +160,12 @@ class PartyEngine:
         self._palette = build_palette({})
 
         self._ring, self._height, self._side = _room_layout(channels)
+        self._band_slot = _band_slots(self._height)
+        self._band_fast = [0.0 for _ in channels]
+        self._band_base = [0.0 for _ in channels]
+        self._react = [0.0 for _ in channels]
+        self._hit = 0.0
+        self._hit_at_us: int | None = None
 
         self._pending_spectrum: deque[tuple[int, list[int]]] = deque()
         self._pending_peaks: deque[tuple[int, float]] = deque()
@@ -218,6 +249,8 @@ class PartyEngine:
         self._last_beat_us = None
         for flash in self._flashes:
             flash.amp = 0.0
+        self._react = [0.0 for _ in self._channels]
+        self._hit_at_us = None
 
     # -- Rendering --
 
@@ -242,12 +275,13 @@ class PartyEngine:
                 for (pc, pl), (cc, cl) in zip(previous, current, strict=True)
             ]
 
+        hit = self._hit_level(now_us)
         commands: list[LightColorCommand] = []
         for i, channel in enumerate(self._channels):
             color, level = current[i]
             amp, white = self._envelope(i, now_us)
             color = _lerp(color, _WHITE, min(1.0, white))
-            scale = max(0.0, min(1.0, level + amp)) * self._brightness
+            scale = max(0.0, min(1.0, level + amp + hit)) * self._brightness
             commands.append(_to_command(channel.channel_id, color, scale))
         return commands
 
@@ -257,6 +291,8 @@ class PartyEngine:
         """Return the base (color, level) per light for ``scene``, before flashes."""
         n = len(self._channels)
         pos = self._palette_pos
+        floor, ceiling = _SCENE_RANGE[scene]
+        levels = [floor + (ceiling - floor) * self._react[i] for i in range(n)]
         if scene == SCENE_CHILL:
             # A slow wave rolling around the room, one cycle every two bars.
             bar_s = 4 * self._beat_period_us / 1_000_000
@@ -264,7 +300,7 @@ class PartyEngine:
             return [
                 (
                     self._sample(pos + self._ring[i] * 0.6),
-                    0.32 + 0.08 * math.sin(2 * math.pi * (cycle + self._ring[i])),
+                    levels[i] + 0.05 * math.sin(2 * math.pi * (cycle + self._ring[i])),
                 )
                 for i in range(n)
             ]
@@ -272,15 +308,21 @@ class PartyEngine:
             progress = self._build_progress(now_us)
             color = _lerp(self._sample(pos), _WHITE, 0.6 * progress)
             fill = 0.15 + progress
+            # The floor rises through the build; lights above the fill line stay dim.
+            lit_floor = floor + 0.3 * progress
             return [
-                (color, 0.25 + 0.45 * progress if self._height[i] <= fill else 0.08)
+                (
+                    color,
+                    lit_floor + (ceiling - lit_floor) * self._react[i]
+                    if self._height[i] <= fill
+                    else 0.08 + 0.2 * self._react[i],
+                )
                 for i in range(n)
             ]
         if scene == SCENE_PEAK:
-            return [(self._sample(pos + self._side[i]), 0.22) for i in range(n)]
+            return [(self._sample(pos + self._side[i]), levels[i]) for i in range(n)]
         return [
-            (self._sample(pos + self._side[i] + self._ring[i] * 0.25), 0.38 + 0.15 * self._punch)
-            for i in range(n)
+            (self._sample(pos + self._side[i] + self._ring[i] * 0.25), levels[i]) for i in range(n)
         ]
 
     # -- Feature tracking --
@@ -293,6 +335,7 @@ class PartyEngine:
         if not bins:
             return
         norm = [_lift(b) for b in bins]
+        self._update_bands(norm, dt, seed=self._ceiling is None)
         loud = _mean(norm[:_LOUDNESS_BINS])
         bass = _mean(norm[:_BASS_BINS])
         high = _mean(norm[_HIGH_BINS[0] : _HIGH_BINS[1]]) if len(norm) > _HIGH_BINS[0] else 0.0
@@ -329,6 +372,25 @@ class PartyEngine:
         )
         self._tension_fast = _ema(self._tension_fast, tension, dt, _TENSION_FAST_TAU)
         self._tension_slow = _ema(self._tension_slow, tension, dt, _TENSION_SLOW_TAU)
+
+    def _update_bands(self, norm: list[float], dt: float, *, seed: bool) -> None:
+        """Step every light's band filters and refresh its 0-1 reactive level."""
+        n = len(self._channels)
+        usable = min(_BAND_BINS, len(norm))
+        if n == 0 or usable == 0:
+            return
+        for i in range(n):
+            slot = self._band_slot[i]
+            lo = (slot * usable) // n
+            hi = max(lo + 1, ((slot + 1) * usable) // n)
+            energy = _mean(norm[lo:hi])
+            if seed:
+                self._band_fast[i] = self._band_base[i] = energy
+            tau = _BAND_RISE_TAU if energy > self._band_fast[i] else _BAND_DECAY_TAU
+            self._band_fast[i] = _ema(self._band_fast[i], energy, dt, tau)
+            self._band_base[i] = _ema(self._band_base[i], energy, dt, _BAND_BASELINE_TAU)
+            transient = max(0.0, self._band_fast[i] - self._band_base[i])
+            self._react[i] = min(1.0, transient * _BAND_TRANSIENT_SCALE)
 
     def _update_scene(self, now_us: int) -> None:
         """Pick the scene for this frame and fire a drop on a quiet-to-peak jump."""
@@ -404,6 +466,10 @@ class PartyEngine:
             ts, strength = self._pending_peaks.popleft()
             if now_us - ts > _BEAT_LATE_US:
                 continue
+            boost = _SCENE_HIT[self._scene] * strength
+            if boost > 0.0 and boost >= self._hit_level(now_us):
+                self._hit = boost
+                self._hit_at_us = ts
             if not self._beats and (
                 self._last_beat_us is None or ts - self._last_beat_us > self._beat_period_us // 2
             ):
@@ -426,15 +492,13 @@ class PartyEngine:
             return
 
         if self._scene == SCENE_CHILL:
-            if is_downbeat:
-                self._palette_target += 0.25
+            self._palette_target += 0.125
             return
         if self._scene == SCENE_GROOVE:
-            if is_downbeat:
-                self._palette_target += 1.0
+            self._palette_target += 0.5
             order = sorted(range(n), key=lambda i: self._ring[i])
             lead = order[self._beat_count % n]
-            self._trigger(lead, now_us, amp=0.55, decay_us=300_000, white=0.1)
+            self._trigger(lead, now_us, amp=0.35, decay_us=250_000, white=0.1)
             return
         if self._scene == SCENE_BUILD:
             progress = self._build_progress(now_us)
@@ -444,20 +508,20 @@ class PartyEngine:
                     self._trigger(
                         i,
                         now_us,
-                        amp=0.25 + 0.5 * progress,
+                        amp=0.2 + 0.4 * progress,
                         decay_us=int(300_000 - 150_000 * progress),
                         white=0.3 + 0.5 * progress,
                     )
             return
+        self._palette_target += 0.5
         if is_downbeat:
-            self._palette_target += 1.0
             for i in range(n):
-                self._trigger(i, now_us, amp=0.75, decay_us=320_000, white=0.25)
+                self._trigger(i, now_us, amp=0.6, decay_us=300_000, white=0.25)
             return
         group = self._beat_count % 2
         for i in range(n):
             if (self._side[i] >= 0.5) == bool(group):
-                self._trigger(i, now_us, amp=0.75, decay_us=220_000, white=0.1)
+                self._trigger(i, now_us, amp=0.5, decay_us=220_000, white=0.1)
 
     def _advance_palette(self, now_us: int) -> None:
         """Ease the palette position toward its target at a scene-dependent speed."""
@@ -468,6 +532,18 @@ class PartyEngine:
             self._palette_target += 0.04 * dt
         tau = {SCENE_CHILL: 2.0, SCENE_GROOVE: 0.3, SCENE_BUILD: 1.0}.get(self._scene, 0.08)
         self._palette_pos = _ema(self._palette_pos, self._palette_target, dt, tau)
+
+    def _hit_level(self, now_us: int) -> float:
+        """Return the decayed brightness lift from the latest onset hit."""
+        if self._hit_at_us is None:
+            return 0.0
+        elapsed = now_us - self._hit_at_us
+        if elapsed < 0:
+            return 0.0
+        if elapsed >= _HIT_DECAY_US:
+            self._hit_at_us = None
+            return 0.0
+        return self._hit * (1.0 - elapsed / _HIT_DECAY_US)
 
     def _build_progress(self, now_us: int) -> float:
         """Return 0-1 progress through the current build-up."""
@@ -546,6 +622,19 @@ def _room_layout(
     else:
         side = [float(i % 2) for i in range(n)]
     return ring, height, side
+
+
+def _band_slots(height: list[float]) -> list[int]:
+    """
+    Assign each light a spectrum band slot, lowest light first (bass) when heights differ.
+
+    Lights at one height keep their channel order.
+    """
+    order = sorted(range(len(height)), key=lambda i: (height[i], i))
+    slots = [0] * len(height)
+    for slot, idx in enumerate(order):
+        slots[idx] = slot
+    return slots
 
 
 def _ema(value: float, target: float, dt: float, tau: float) -> float:

@@ -149,6 +149,29 @@ class TestScenes:
         assert drops == []
 
 
+class TestReactivity:
+    """Tests for the continuous per-light spectrum reaction."""
+
+    def test_lights_react_to_hits_in_chill(self) -> None:
+        """A sudden bass hit lifts the bass light even in the calm scene."""
+        engine = PartyEngine(
+            _make_channels([(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)]),
+        )
+        ts, _ = _feed(engine, 1_000_000, 5.0, level=0.05)
+        assert engine.debug_state()["scene"] == SCENE_CHILL
+        before = engine.render(ts)[0]
+        engine.apply_spectrum([int(0.6 * 65535)] * 2 + [int(0.05 * 65535)] * 15, ts)
+        after = engine.render(ts)[0]
+        assert max(after.red, after.green, after.blue) > max(before.red, before.green, before.blue)
+
+    def test_bass_goes_to_lowest_light(self) -> None:
+        """The lowest light gets the first (bass) band regardless of channel order."""
+        engine = PartyEngine(
+            _make_channels([(0.0, 0.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.5)]),
+        )
+        assert engine._band_slot == [2, 0, 1]
+
+
 class TestBeats:
     """Tests for beat and onset handling."""
 
