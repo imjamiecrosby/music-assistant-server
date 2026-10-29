@@ -1,9 +1,9 @@
 """
 Section-aware "dance party" effects engine for Hue Entertainment.
 
-Every light reacts continuously to its own spectrum band, like the classic analyzer's
-energetic mode, so each kick and snare shows. On top of that the engine follows the
-song's shape: it tracks how intense the music is relative to the track itself and picks
+Every light reacts continuously, mostly to the beat (a pulse on each beat plus the kick
+itself) with its own spectrum band adding texture, so the room moves with the rhythm
+rather than the vocals. On top of that the engine follows the song's shape: it tracks how intense the music is relative to the track itself and picks
 a scene that sets how wide that reaction is and what happens on the beat:
 
 - chill: a narrower range and a slow colour wave rolling around the room
@@ -82,20 +82,33 @@ _DROP_HISTORY_MAX = 0.55
 _DROP_JUMP = 0.08
 _DROP_MIN_PUNCH = 0.15
 
-# Continuous per-light reactivity. Each light follows a band of the spectrum (the lowest
-# light gets the bass) and its brightness tracks how far the band's fast level sits above
-# a slow baseline, so sustained sound settles while every new hit lifts the light.
-_BAND_BINS = 11
+# Continuous per-light reactivity. A band's reaction is how far its fast level rises above
+# the dip between hits, scaled by its own recent peak so it spans 0-1 on loud, compressed
+# masters and quiet recordings alike. Light bands skip the vocal mids: the lowest light
+# follows the kick, the highest the hi-hats and cymbals, any lights between the snare body.
+_KICK_BAND = (0, 3)
+_SNARE_BAND = (3, 6)
+_HAT_BAND = (9, 15)
 _BAND_RISE_TAU = 0.02
-_BAND_DECAY_TAU = 0.3
-_BAND_BASELINE_TAU = 2.5
-_BAND_TRANSIENT_SCALE = 8.0
+# Shorter than the gap between kicks at any dance tempo, so each hit falls back down.
+_BAND_DECAY_TAU = 0.08
+_BAND_DIP_TAU = 0.1
+_BAND_DIP_RISE_TAU = 1.0
+_BAND_PEAK_DECAY_TAU = 4.0
+_BAND_MIN_PEAK = 0.03
+# Share of each light's reaction that comes from the room-wide rhythm (beat pulse or
+# kick, whichever is stronger) rather than its own band.
+_RHYTHM_WEIGHT = 0.75
+# Beat pulse: decays over this fraction of the beat period; downbeats pulse fuller.
+_BEAT_PULSE_TAU_FRACTION = 0.3
+_DOWNBEAT_PULSE = 1.0
+_OFFBEAT_PULSE = 0.8
 # Each scene's (floor, ceiling) for that reactive brightness.
 _SCENE_RANGE: dict[str, tuple[float, float]] = {
-    SCENE_CHILL: (0.28, 0.60),
-    SCENE_GROOVE: (0.30, 0.95),
-    SCENE_BUILD: (0.25, 1.0),
-    SCENE_PEAK: (0.20, 1.0),
+    SCENE_CHILL: (0.50, 0.80),
+    SCENE_GROOVE: (0.55, 1.0),
+    SCENE_BUILD: (0.45, 1.0),
+    SCENE_PEAK: (0.50, 1.0),
 }
 # Onset hits lift every light by up to this much (times onset strength) per scene.
 _SCENE_HIT: dict[str, float] = {
@@ -118,6 +131,17 @@ _DEFAULT_BEAT_US = 500_000
 _PEAK_MIN_STRENGTH = 0.1
 
 _WHITE = (0.85, 0.85, 0.85)
+# Every palette colour is pushed to this peak so none sits dimmed for contrast.
+_PALETTE_PEAK = 0.85
+# Cover art with no colour this vivid (a grey logo, a monochrome cover) gets the
+# fallback palette instead of tinted whites, which read as dull at a party.
+_PALETTE_MIN_VIVID = 0.3
+_PARTY_FALLBACK: tuple[tuple[float, float, float], ...] = (
+    (0.85, 0.0, 0.55),
+    (0.0, 0.55, 0.85),
+    (0.45, 0.0, 0.85),
+    (0.85, 0.35, 0.0),
+)
 
 
 @dataclass(slots=True)
@@ -135,6 +159,32 @@ class _Flash:
     start_us: int = 0
     decay_us: int = 1
     onsets: deque[int] | None = None
+
+
+class _Reactor:
+    """Turn one band's energy into a 0-1 hit reaction with its own automatic gain."""
+
+    def __init__(self) -> None:
+        self.fast = 0.0
+        self.dip = 0.0
+        self.peak = _BAND_MIN_PEAK
+        self.value = 0.0
+
+    def update(self, energy: float, dt: float, *, seed: bool) -> float:
+        """Step the filters with one frame's band energy and return the reaction."""
+        if seed:
+            self.fast = self.dip = energy
+        tau = _BAND_RISE_TAU if energy > self.fast else _BAND_DECAY_TAU
+        self.fast = _ema(self.fast, energy, dt, tau)
+        dip_tau = _BAND_DIP_TAU if energy < self.dip else _BAND_DIP_RISE_TAU
+        self.dip = _ema(self.dip, energy, dt, dip_tau)
+        transient = max(0.0, self.fast - self.dip)
+        if transient > self.peak:
+            self.peak = transient
+        else:
+            self.peak = max(_BAND_MIN_PEAK, _ema(self.peak, transient, dt, _BAND_PEAK_DECAY_TAU))
+        self.value = min(1.0, transient / self.peak)
+        return self.value
 
 
 class PartyEngine:
@@ -157,13 +207,16 @@ class PartyEngine:
         self._color_mode = color_mode
         self._brightness = max(0, min(100, brightness)) / 100.0
         self._server_palette: dict[str, tuple[int, int, int] | None] = {}
-        self._palette = build_palette({})
+        self._palette = _party_palette({})
 
         self._ring, self._height, self._side = _room_layout(channels)
         self._band_slot = _band_slots(self._height)
-        self._band_fast = [0.0 for _ in channels]
-        self._band_base = [0.0 for _ in channels]
+        self._bands = [_Reactor() for _ in channels]
         self._react = [0.0 for _ in channels]
+        self._kick_reactor = _Reactor()
+        self._kick = 0.0
+        self._last_downbeat = False
+        self._drive = [0.0 for _ in channels]
         self._hit = 0.0
         self._hit_at_us: int | None = None
 
@@ -216,7 +269,7 @@ class PartyEngine:
     def apply_color_palette(self, update: dict[str, tuple[int, int, int] | None]) -> None:
         """Merge a color@v1 update and rebuild the palette."""
         self._server_palette.update(update)
-        self._palette = build_palette(self._server_palette)
+        self._palette = _party_palette(self._server_palette)
 
     def apply_spectrum(self, bins: list[int], timestamp_us: int) -> None:
         """Queue a spectrum frame until playback reaches its timestamp."""
@@ -250,6 +303,7 @@ class PartyEngine:
         for flash in self._flashes:
             flash.amp = 0.0
         self._react = [0.0 for _ in self._channels]
+        self._kick = 0.0
         self._hit_at_us = None
 
     # -- Rendering --
@@ -266,6 +320,10 @@ class PartyEngine:
         if not self._channels:
             return []
 
+        rhythm = max(self._beat_pulse(now_us), self._kick)
+        self._drive = [
+            _RHYTHM_WEIGHT * rhythm + (1.0 - _RHYTHM_WEIGHT) * react for react in self._react
+        ]
         current = self._render_scene(self._scene, now_us)
         fade = (now_us - self._scene_since_us) / _SCENE_FADE_US
         if 0.0 <= fade < 1.0 and self._prev_scene != self._scene:
@@ -281,7 +339,10 @@ class PartyEngine:
             color, level = current[i]
             amp, white = self._envelope(i, now_us)
             color = _lerp(color, _WHITE, min(1.0, white))
-            scale = max(0.0, min(1.0, level + amp + hit)) * self._brightness
+            # Screen-blend flashes and hits onto the base level so they brighten a light
+            # without pinning it at full output, where the beat would no longer show.
+            lifted = 1.0 - (1.0 - max(0.0, min(1.0, level))) * (1.0 - amp) * (1.0 - hit)
+            scale = max(0.0, min(1.0, lifted)) * self._brightness
             commands.append(_to_command(channel.channel_id, color, scale))
         return commands
 
@@ -292,7 +353,7 @@ class PartyEngine:
         n = len(self._channels)
         pos = self._palette_pos
         floor, ceiling = _SCENE_RANGE[scene]
-        levels = [floor + (ceiling - floor) * self._react[i] for i in range(n)]
+        levels = [floor + (ceiling - floor) * self._drive[i] for i in range(n)]
         if scene == SCENE_CHILL:
             # A slow wave rolling around the room, one cycle every two bars.
             bar_s = 4 * self._beat_period_us / 1_000_000
@@ -313,9 +374,9 @@ class PartyEngine:
             return [
                 (
                     color,
-                    lit_floor + (ceiling - lit_floor) * self._react[i]
+                    lit_floor + (ceiling - lit_floor) * self._drive[i]
                     if self._height[i] <= fill
-                    else 0.08 + 0.2 * self._react[i],
+                    else 0.08 + 0.2 * self._drive[i],
                 )
                 for i in range(n)
             ]
@@ -374,23 +435,16 @@ class PartyEngine:
         self._tension_slow = _ema(self._tension_slow, tension, dt, _TENSION_SLOW_TAU)
 
     def _update_bands(self, norm: list[float], dt: float, *, seed: bool) -> None:
-        """Step every light's band filters and refresh its 0-1 reactive level."""
+        """Step the kick and every light's band filters and refresh their 0-1 reactions."""
         n = len(self._channels)
-        usable = min(_BAND_BINS, len(norm))
-        if n == 0 or usable == 0:
+        if not norm:
             return
+        self._kick = self._kick_reactor.update(
+            _mean(norm[_KICK_BAND[0] : _KICK_BAND[1]]), dt, seed=seed
+        )
         for i in range(n):
-            slot = self._band_slot[i]
-            lo = (slot * usable) // n
-            hi = max(lo + 1, ((slot + 1) * usable) // n)
-            energy = _mean(norm[lo:hi])
-            if seed:
-                self._band_fast[i] = self._band_base[i] = energy
-            tau = _BAND_RISE_TAU if energy > self._band_fast[i] else _BAND_DECAY_TAU
-            self._band_fast[i] = _ema(self._band_fast[i], energy, dt, tau)
-            self._band_base[i] = _ema(self._band_base[i], energy, dt, _BAND_BASELINE_TAU)
-            transient = max(0.0, self._band_fast[i] - self._band_base[i])
-            self._react[i] = min(1.0, transient * _BAND_TRANSIENT_SCALE)
+            lo, hi = _light_band(self._band_slot[i], n)
+            self._react[i] = self._bands[i].update(_mean(norm[lo:hi]), dt, seed=seed)
 
     def _update_scene(self, now_us: int) -> None:
         """Pick the scene for this frame and fire a drop on a quiet-to-peak jump."""
@@ -486,16 +540,18 @@ class PartyEngine:
             if 200_000 <= interval <= 1_500_000:
                 self._beat_period_us = int(0.8 * self._beat_period_us + 0.2 * interval)
         self._last_beat_us = ts
+        self._last_downbeat = is_downbeat
         self._beat_count += 1
         n = len(self._channels)
         if n == 0:
             return
 
+        # Colours step once per bar so they read as part of the song, not as noise.
+        if is_downbeat:
+            self._palette_target += 0.25 if self._scene == SCENE_CHILL else 1.0
         if self._scene == SCENE_CHILL:
-            self._palette_target += 0.125
             return
         if self._scene == SCENE_GROOVE:
-            self._palette_target += 0.5
             order = sorted(range(n), key=lambda i: self._ring[i])
             lead = order[self._beat_count % n]
             self._trigger(lead, now_us, amp=0.35, decay_us=250_000, white=0.1)
@@ -513,7 +569,6 @@ class PartyEngine:
                         white=0.3 + 0.5 * progress,
                     )
             return
-        self._palette_target += 0.5
         if is_downbeat:
             for i in range(n):
                 self._trigger(i, now_us, amp=0.6, decay_us=300_000, white=0.25)
@@ -532,6 +587,17 @@ class PartyEngine:
             self._palette_target += 0.04 * dt
         tau = {SCENE_CHILL: 2.0, SCENE_GROOVE: 0.3, SCENE_BUILD: 1.0}.get(self._scene, 0.08)
         self._palette_pos = _ema(self._palette_pos, self._palette_target, dt, tau)
+
+    def _beat_pulse(self, now_us: int) -> float:
+        """Return the decaying 0-1 pulse from the latest beat."""
+        if self._last_beat_us is None:
+            return 0.0
+        elapsed = now_us - self._last_beat_us
+        if elapsed < 0:
+            return 0.0
+        tau = max(1.0, self._beat_period_us * _BEAT_PULSE_TAU_FRACTION)
+        peak = _DOWNBEAT_PULSE if self._last_downbeat else _OFFBEAT_PULSE
+        return peak * math.exp(-elapsed / tau)
 
     def _hit_level(self, now_us: int) -> float:
         """Return the decayed brightness lift from the latest onset hit."""
@@ -622,6 +688,45 @@ def _room_layout(
     else:
         side = [float(i % 2) for i in range(n)]
     return ring, height, side
+
+
+def _party_palette(
+    server_palette: dict[str, tuple[int, int, int] | None],
+) -> list[tuple[float, float, float]]:
+    """
+    Build the cycling palette at full, even brightness, with a vivid fallback.
+
+    :param server_palette: Merged color@v1 fields as 0-255 RGB triples.
+    """
+    palette = [
+        (r * _PALETTE_PEAK / peak, g * _PALETTE_PEAK / peak, b * _PALETTE_PEAK / peak)
+        for r, g, b in build_palette(server_palette)
+        if (peak := max(r, g, b)) > 1e-6
+    ]
+    if not palette or max(_vividness(c) for c in palette) < _PALETTE_MIN_VIVID:
+        return list(_PARTY_FALLBACK)
+    return palette
+
+
+def _vividness(rgb: tuple[float, float, float]) -> float:
+    """Return HSV saturation: 0 for greys and whites, 1 for pure colours."""
+    peak = max(rgb)
+    return 0.0 if peak <= 0.0 else (peak - min(rgb)) / peak
+
+
+def _light_band(slot: int, count: int) -> tuple[int, int]:
+    """
+    Return the spectrum bin range a light follows, from its height rank.
+
+    :param slot: The light's rank from lowest (0) to highest.
+    :param count: Number of lights.
+    """
+    position = slot / (count - 1) if count > 1 else 0.0
+    if position < 1 / 3:
+        return _KICK_BAND
+    if position > 2 / 3:
+        return _HAT_BAND
+    return _SNARE_BAND
 
 
 def _band_slots(height: list[float]) -> list[int]:

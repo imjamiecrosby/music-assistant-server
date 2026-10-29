@@ -10,10 +10,18 @@ from hue_entertainment import LightChannel
 
 from music_assistant.providers.hue_entertainment.party_engine import (
     _FLASH_LIMIT,
+    _HAT_BAND,
+    _KICK_BAND,
+    _PALETTE_PEAK,
+    _PARTY_FALLBACK,
+    _SNARE_BAND,
     SCENE_BUILD,
     SCENE_CHILL,
     SCENE_PEAK,
     PartyEngine,
+    _light_band,
+    _party_palette,
+    _Reactor,
     _room_layout,
 )
 
@@ -170,6 +178,56 @@ class TestReactivity:
             _make_channels([(0.0, 0.0, 1.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.5)]),
         )
         assert engine._band_slot == [2, 0, 1]
+
+    def test_light_bands_skip_vocal_mids(self) -> None:
+        """Two lights follow the kick and the hi-hats; a middle light the snare body."""
+        assert _light_band(0, 2) == _KICK_BAND
+        assert _light_band(1, 2) == _HAT_BAND
+        assert _light_band(1, 3) == _SNARE_BAND
+        for lo, hi in (_KICK_BAND, _SNARE_BAND, _HAT_BAND):
+            assert hi <= 6 or lo >= 9
+
+    def test_vocal_swell_does_not_drive_lights(self) -> None:
+        """A rise in the vocal-range bins alone barely moves the lights."""
+        engine = PartyEngine(_make_channels(count=2))
+        ts, _ = _feed(engine, 1_000_000, 5.0, level=0.1)
+        before = [max(c.red, c.green, c.blue) for c in engine.render(ts)]
+        vocal = [int(0.1 * 65535)] * 4 + [int(0.9 * 65535)] * 5 + [int(0.1 * 65535)] * 8
+        for _ in range(3):
+            ts += _FRAME_US
+            engine.apply_spectrum(vocal, ts)
+        after = [max(c.red, c.green, c.blue) for c in engine.render(ts)]
+        for b, a in zip(before, after, strict=True):
+            assert a - b < 0.1 * 65535
+
+    def test_reactor_auto_gain(self) -> None:
+        """Quiet and loud material both reach a full reaction on their own hits."""
+        for scale in (0.05, 0.5):
+            reactor = _Reactor()
+            reactor.update(scale * 0.2, 1 / 30, seed=True)
+            value = 0.0
+            for _ in range(60):
+                for frame in range(15):
+                    energy = scale * (1.0 if frame == 0 else 0.2)
+                    value = max(value, reactor.update(energy, 1 / 30, seed=False))
+            assert value > 0.9
+
+
+class TestPalette:
+    """Tests for the party palette."""
+
+    def test_colors_are_never_dimmed(self) -> None:
+        """Every palette colour runs at the same full peak."""
+        palette = _party_palette(
+            {"primary": (230, 30, 40), "accent": (220, 40, 50), "on_dark": (30, 60, 230)}
+        )
+        for color in palette:
+            assert max(color) == pytest.approx(_PALETTE_PEAK)
+
+    def test_grey_cover_gets_vivid_fallback(self) -> None:
+        """A cover with no real colour uses the party fallback, not tinted whites."""
+        assert _party_palette({"primary": (200, 200, 200)}) == list(_PARTY_FALLBACK)
+        assert _party_palette({}) == list(_PARTY_FALLBACK)
 
 
 class TestBeats:
